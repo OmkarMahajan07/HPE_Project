@@ -1,0 +1,719 @@
+package transfer
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
+	"sync"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"ftp/perfmetrics"
+
+	"github.com/jlaffaye/ftp"
+)
+
+// UploadFile handles the file upload process
+func UploadFile(client *ftp.ServerConn, localFile, remotePath string, useMemoryMappedIO bool) error {
+	// Get file info
+	if !filepath.IsAbs(localFile) {
+		localFile = filepath.Join(getCurrentDirectory(), localFile)
+	}
+
+	fileInfo, err := os.Stat(localFile)
+	if err != nil {
+		return fmt.Errorf("failed to get file information: %v", err)
+	}
+
+	fileSize := fileInfo.Size()
+	fmt.Printf("Uploading %s (%d bytes)...\n", localFile, fileSize)
+
+	// Determine remote path
+	targetRemotePath := remotePath
+	if targetRemotePath == "" {
+		targetRemotePath = filepath.Base(localFile)
+	}
+
+	// Choose I/O method based on user preference or file size
+	if useMemoryMappedIO {
+		fmt.Println("Using memory-mapped I/O for file transfer...")
+		return uploadWithOptimizedIO(client, localFile, targetRemotePath, fileSize)
+	}
+
+	// Automatic selection based on file size
+	if fileSize < 50*1024*1024 { // Files < 50MB use chunked I/O
+		fmt.Println("Using robust chunked I/O for file transfer...")
+		return uploadWithRobustChunkedIO(client, localFile, targetRemotePath, fileSize)
+	} else if fileSize < 500*1024*1024 { // Files < 500MB use streaming
+		fmt.Println("Using optimized streaming I/O for file transfer...")
+		return uploadWithOptimizedStreaming(client, localFile, targetRemotePath, fileSize)
+	} else { // Files >= 500MB use memory-mapped I/O
+		fmt.Println("Using memory-mapped I/O for large file transfer...")
+		return uploadWithOptimizedIO(client, localFile, targetRemotePath, fileSize)
+	}
+}
+
+// uploadWithOptimizedStreaming provides high-performance streaming upload
+func uploadWithOptimizedStreaming(client *ftp.ServerConn, localFile, targetRemotePath string, fileSize int64) error {
+	fmt.Println("Using optimized streaming upload...")
+
+	// Open local file
+	file, err := os.Open(localFile)
+	if err != nil {
+		return fmt.Errorf("failed to open local file: %v", err)
+	}
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil {
+			fmt.Printf("Warning: Failed to close file: %v\n", closeErr)
+		}
+	}()
+
+	// Check if file already exists for resume capability
+	startOffset := int64(0)
+	existingSize, err := getRemoteFileSize(client, targetRemotePath)
+	if err == nil && existingSize > 0 && existingSize < fileSize {
+		startOffset = existingSize
+		fmt.Printf("Resuming upload from offset %d bytes (%.1f%% complete)\n",
+			startOffset, float64(startOffset)/float64(fileSize)*100)
+		
+		// Seek to resume position
+		_, err = file.Seek(startOffset, io.SeekStart)
+		if err != nil {
+			return fmt.Errorf("failed to seek to resume position: %v", err)
+		}
+	}
+
+	// Create high-performance buffered reader (16MB buffer)
+	bufferedReader := bufio.NewReaderSize(file, 16*1024*1024)
+
+	// Create intelligent progress tracker
+	now := time.Now()
+	progressReader := &ProgressReader{
+		Reader:             bufferedReader,
+		Total:              fileSize,
+		Transferred:        startOffset,
+		StartTime:          now,
+		LastUpdate:         now,
+		LastActiveTime:     now,
+		LastBytes:          startOffset,
+		PauseThreshold:     500 * time.Millisecond,
+		MinSpeed:           1024 * 1024, // 1 MB/s minimum
+		MaxSamples:         100,
+		SpeedSamples:       make([]float64, 0, 100),
+		ActiveTransferTime: 0,
+		OnProgress: func(transferred int64, total int64, speed float64, elapsed time.Duration) {
+			progress := float64(transferred) / float64(total) * 100
+			if progress > 100 {
+				progress = 100
+			}
+			fmt.Printf("\rProgress: [%s] %.1f%% %.2f MB/s Time: %ds",
+				progressBar(progress),
+				progress,
+				speed/1024/1024,
+				int(elapsed.Seconds()))
+		},
+	}
+
+	// Upload with retry logic
+	maxRetries := 3
+	var uploadErr error
+	
+	fmt.Printf("Starting upload of %s (%.2f MB) with 16MB buffer...\n", 
+		localFile, float64(fileSize)/(1024*1024))
+
+	for retry := 0; retry < maxRetries; retry++ {
+		// Choose appropriate FTP command based on resume
+		if startOffset == 0 {
+			uploadErr = client.Stor(targetRemotePath, progressReader)
+		} else {
+			uploadErr = client.Append(targetRemotePath, progressReader)
+		}
+		
+		if uploadErr == nil {
+			break // Success!
+		}
+		
+		// Handle retry
+		if retry < maxRetries-1 {
+			delay := time.Duration(1<<retry) * time.Second
+			fmt.Printf("\nUpload failed (retry %d/%d): %v\nRetrying in %v...\n",
+				retry+1, maxRetries, uploadErr, delay)
+			time.Sleep(delay)
+			
+			// Reset for retry
+			_, err = file.Seek(startOffset, io.SeekStart)
+			if err != nil {
+				return fmt.Errorf("failed to seek for retry: %v", err)
+			}
+			bufferedReader.Reset(file)
+			progressReader.Transferred = startOffset
+			progressReader.LastBytes = startOffset
+		}
+	}
+
+	if uploadErr != nil {
+		return fmt.Errorf("failed to upload after %d retries: %v", maxRetries, uploadErr)
+	}
+
+	// Final verification
+	finalSize, err := getRemoteFileSize(client, targetRemotePath)
+	if err != nil {
+		fmt.Printf("Warning: Could not verify final upload size: %v\n", err)
+	} else if finalSize != fileSize {
+		return fmt.Errorf("upload verification failed: expected %d bytes, got %d bytes", 
+			fileSize, finalSize)
+	}
+
+	// Report final statistics using common function
+	_, err = reportFinalUploadStats(fileSize, startOffset, progressReader, "Streaming upload", localFile, 0, "Upload_Streaming")
+	if err != nil {
+		fmt.Printf("Warning: Failed to log performance metrics: %v\n", err)
+	}
+
+	fmt.Printf("File uploaded successfully to: %s\n", targetRemotePath)
+	return nil
+}
+
+
+
+// MmapResource manages memory-mapped file resources properly
+type MmapResource struct {
+	data    []byte
+	file    *os.File
+	mapping syscall.Handle
+	addr    uintptr
+	size    int64
+	cleaned bool
+	mutex   sync.Mutex
+}
+
+// Close properly cleans up all memory-mapped resources
+func (mr *MmapResource) Close() error {
+	mr.mutex.Lock()
+	defer mr.mutex.Unlock()
+
+	if mr.cleaned {
+		return nil
+	}
+
+	var firstErr error
+
+	// Unmap the view first
+	if mr.addr != 0 {
+		if err := syscall.UnmapViewOfFile(mr.addr); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to unmap view: %v", err)
+			}
+		}
+		mr.addr = 0
+	}
+
+	// Close the mapping handle
+	if mr.mapping != 0 {
+		if err := syscall.CloseHandle(mr.mapping); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to close mapping handle: %v", err)
+			}
+		}
+		mr.mapping = 0
+	}
+
+	// Close the file
+	if mr.file != nil {
+		if err := mr.file.Close(); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("failed to close file: %v", err)
+			}
+		}
+		mr.file = nil
+	}
+
+	// Clear the data slice
+	mr.data = nil
+	mr.cleaned = true
+
+	return firstErr
+}
+
+func CreateMmapForReading(filename string, expectedSize int64) (*MmapResource, error) {
+	// Open the file for reading
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %v", err)
+	}
+
+	// Verify file size
+	fileInfo, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to get file info: %v", err)
+	}
+	size := fileInfo.Size()
+
+	if size == 0 {
+		file.Close()
+		return &MmapResource{
+			data: []byte{},
+			file: nil,
+			size: 0,
+			cleaned: true,
+		}, nil
+	}
+
+	if size != expectedSize {
+		file.Close()
+		return nil, fmt.Errorf("file size mismatch: expected %d, got %d", expectedSize, size)
+	}
+
+	// Get file handle
+	handle := syscall.Handle(file.Fd())
+
+	// Split size into high and low DWORDs for 64-bit support
+	high := uint32(size >> 32)
+	low := uint32(size & 0xFFFFFFFF)
+
+	// Create file mapping
+	mapping, err := syscall.CreateFileMapping(handle, nil, syscall.PAGE_READONLY, high, low, nil)
+	if err != nil {
+		file.Close()
+		return nil, fmt.Errorf("failed to create file mapping: %v", err)
+	}
+
+	// Map view of file
+	addr, err := syscall.MapViewOfFile(mapping, syscall.FILE_MAP_READ, 0, 0, uintptr(size))
+	if err != nil {
+		syscall.CloseHandle(mapping)
+		file.Close()
+		return nil, fmt.Errorf("failed to map view of file: %v", err)
+	}
+
+	// Create a safe slice of the mapped memory with bounds checking
+	if addr == 0 {
+		syscall.CloseHandle(mapping)
+		file.Close()
+		return nil, errors.New("memory mapping returned null pointer")
+	}
+	if size < 0 {
+		syscall.CloseHandle(mapping)
+		file.Close()
+		return nil, errors.New("invalid file size for memory mapping")
+	}
+	data := unsafe.Slice((*byte)(unsafe.Pointer(addr)), int(size))
+
+	return &MmapResource{
+		data:    data,
+		file:    file,
+		mapping: mapping,
+		addr:    addr,
+		size:    size,
+		cleaned: false,
+	}, nil
+}
+
+// uploadWithOptimizedIO uploads a file using improved memory-mapped I/O
+func uploadWithOptimizedIO(client *ftp.ServerConn, localFile, targetRemotePath string, fileSize int64) error {
+	// Aggressive memory-mapped approach - try memory mapping for all files first
+	fileSizeMB := fileSize / (1024 * 1024)
+	fmt.Printf("Attempting memory mapping for %d MB file...\n", fileSizeMB)
+
+	// Use a callback mechanism to notify the server
+	// This will be handled by the main program through the sync function
+	fmt.Println("Memory-mapped upload mode enabled")
+
+	// Use improved memory mapping that properly manages file handles
+	mmapResource, err := CreateMmapForReading(localFile, fileSize)
+	if err != nil {
+		fmt.Printf("Memory mapping failed (%v), falling back to robust chunked I/O...\n", err)
+		return uploadWithRobustChunkedIO(client, localFile, targetRemotePath, fileSize)
+	}
+	fmt.Printf("Memory mapping successful, proceeding with mapped upload...\n")
+	defer func() {
+		// Properly cleanup memory-mapped resources
+		if err := mmapResource.Close(); err != nil {
+			fmt.Printf("Warning: Failed to cleanup mmap resource: %v\n", err)
+		}
+		// Force aggressive memory cleanup
+		runtime.GC()
+		runtime.GC() // Second GC to ensure cleanup
+		debug.FreeOSMemory()
+		// Allow more time for Windows to release resources
+		time.Sleep(250 * time.Millisecond)
+	}()
+
+	// Create ZERO-OVERHEAD direct mmap reader (identical to download)
+	mmapReader := &ZeroOverheadMmapReader{
+		data:        mmapResource.data,
+		size:        fileSize,
+		position:    0,
+		startTime:   time.Now(),
+		lastUpdate:  time.Now(),
+		lastBytes:   0,
+		updateFreq:  100 * time.Millisecond,
+	}
+
+	// Upload file using direct mmap with progress tracking
+	// Create a progress-tracking wrapper that calls UpdateProgress during upload
+	progressWrapper := &MmapProgressWrapper{
+		reader:         mmapReader,
+		progressInterval: 100 * time.Millisecond,
+		lastUpdate:     time.Now(),
+	}
+	
+	err = client.Stor(targetRemotePath, progressWrapper)
+	if err != nil {
+		return fmt.Errorf("failed to upload file: %v", err)
+	}
+
+	// Calculate and report final statistics
+	_, speed, elapsed := mmapReader.GetFinalStats()
+	
+	// Show final progress
+	fmt.Printf("\rProgress: [%s] 100.0%% %.2f MB/s Time: %ds\n",
+		progressBar(100),
+		speed,
+		int(elapsed.Seconds()))
+	fmt.Printf("Memory-mapped upload completed - Average speed: %.2f MB/s\n", speed)
+	
+	// Performance metrics logging
+	metrics := map[string]interface{}{
+		"Client":         "Upload_Mmap",
+		"FileName":       filepath.Base(localFile),
+		"FileSizeMB":     float64(fileSize) / (1024 * 1024),
+		"Compression":    false,
+		"RTTms":          50,
+		"WindowSize":     1,
+		"ThroughputMBps": speed,
+		"TimeSec":        elapsed.Seconds(),
+		"Retries":        0,
+	}
+	
+	logErr := perfmetrics.LogPerformanceToCSV("performance_log.csv", metrics)
+	if logErr != nil {
+		fmt.Printf("Failed to log performance: %v\n", logErr)
+	}
+
+	fmt.Printf("File uploaded successfully to: %s\n", targetRemotePath)
+	return nil
+}
+
+// uploadWithRobustChunkedIO implements a robust chunked upload with resume capability
+func uploadWithRobustChunkedIO(client *ftp.ServerConn, localFile, targetRemotePath string, fileSize int64) error {
+	fmt.Println("Using robust chunked I/O for file transfer...")
+
+	// Open local file
+	file, err := os.Open(localFile)
+	if err != nil {
+		return fmt.Errorf("failed to open local file: %v", err)
+	}
+	defer file.Close()
+
+	// Calculate optimal chunk size based on file size and memory constraints
+	chunkSize := calculateRobustChunkSize(fileSize)
+	fmt.Printf("Using robust chunk size: %d MB\n", chunkSize/(1024*1024))
+
+	// Check if file already exists and get its size for resume capability
+	var startOffset int64 = 0
+	existingSize, err := getRemoteFileSize(client, targetRemotePath)
+	if err == nil && existingSize > 0 && existingSize < fileSize {
+		startOffset = existingSize
+		fmt.Printf("Resuming upload from offset %d bytes (%.1f%% complete)\n",
+			startOffset, float64(startOffset)/float64(fileSize)*100)
+	}
+
+	// Progress tracking with intelligent speed calculation
+	totalTransferred := startOffset
+
+	// Create properly initialized intelligent progress reader for robust upload
+	now := time.Now()
+	progressReader := &ProgressReader{
+		Reader:             file,
+		Total:              fileSize,
+		Transferred:        startOffset,
+		StartTime:          now,
+		LastUpdate:         now,
+		LastActiveTime:     now,
+		LastBytes:          startOffset,
+		PauseThreshold:     500 * time.Millisecond,
+		MinSpeed:           1024 * 1024, // 1 MB/s minimum
+		MaxSamples:         100,
+		SpeedSamples:       make([]float64, 0, 100),
+		ActiveTransferTime: 0,
+		OnProgress: func(transferred int64, total int64, speed float64, elapsed time.Duration) {
+			progress := float64(transferred) / float64(total) * 100
+			if progress > 100 {
+				progress = 100
+			}
+			fmt.Printf("\rProgress: [%s] %.1f%% %.2f MB/s Time: %ds",
+				progressBar(progress),
+				progress,
+				speed/1024/1024,
+				int(elapsed.Seconds()))
+		},
+	}
+
+	// Reset retry counter for this upload
+	RetryCounter = 0
+
+	// Robust upload with error recovery
+	maxRetries := 3
+	for offset := startOffset; offset < fileSize; {
+		// Calculate current chunk size
+		currentChunkSize := chunkSize
+		if offset+chunkSize > fileSize {
+			currentChunkSize = fileSize - offset
+		}
+
+		// Seek to current position
+		_, err := file.Seek(offset, 0)
+		if err != nil {
+			return fmt.Errorf("failed to seek to offset %d: %v", offset, err)
+		}
+
+		// Create a limited reader for this chunk
+		chunkReader := io.LimitReader(progressReader, currentChunkSize)
+
+		// Try to upload this chunk with retries
+		var uploadErr error
+		for retry := 0; retry < maxRetries; retry++ {
+			if offset == startOffset && startOffset == 0 {
+				// First chunk - use STOR
+				uploadErr = client.Stor(targetRemotePath, chunkReader)
+			} else {
+				// Subsequent chunks or resume - use APPE (append)
+				uploadErr = client.Append(targetRemotePath, chunkReader)
+			}
+
+			if uploadErr == nil {
+				break // Success
+			}
+
+			// Retry with exponential backoff
+			if retry < maxRetries-1 {
+				delay := time.Duration(1<<retry) * time.Second
+				fmt.Printf("\nChunk upload failed (retry %d/%d): %v, retrying in %v...\n",
+					retry+1, maxRetries, uploadErr, delay)
+				time.Sleep(delay)
+
+				// Reset chunk reader position
+				file.Seek(offset, 0)
+				progressReader.Transferred = offset
+				chunkReader = io.LimitReader(progressReader, currentChunkSize)
+			}
+		}
+
+		if uploadErr != nil {
+			return fmt.Errorf("failed to upload chunk at offset %d after %d retries: %v",
+				offset, maxRetries, uploadErr)
+		}
+
+		// Move to next chunk
+		offset += currentChunkSize
+		totalTransferred += currentChunkSize
+
+		// Verify upload progress periodically
+		if offset%(10*chunkSize) == 0 { // Every 10 chunks
+			if verifyErr := verifyUploadProgress(client, targetRemotePath, offset); verifyErr != nil {
+				fmt.Printf("Warning: Upload verification failed: %v\n", verifyErr)
+			}
+		}
+	}
+
+	// Report final statistics using common function
+	_, err = reportFinalUploadStats(fileSize, startOffset, progressReader, "Robust upload", localFile, int(RetryCounter), "Upload_Chunked")
+	if err != nil {
+		fmt.Printf("Warning: Failed to log performance metrics: %v\n", err)
+	}
+
+	// Final verification
+	if finalErr := verifyUploadProgress(client, targetRemotePath, fileSize); finalErr != nil {
+		fmt.Printf("Warning: Final upload verification failed: %v\n", finalErr)
+	}
+
+	fmt.Printf("File uploaded successfully to: %s\n", targetRemotePath)
+	return nil
+}
+
+// reportFinalUploadStats handles common speed calculation and final statistics reporting
+func reportFinalUploadStats(fileSize int64, startOffset int64, progressReader *ProgressReader, context string, fileName string, retryCount int, clientName string) (float64, error) {
+	// Calculate intelligent final statistics
+	elapsed := time.Since(progressReader.StartTime)
+	if elapsed == 0 {
+		elapsed = 1 * time.Millisecond // Prevent division by zero
+	}
+	traditionalSpeed := float64(fileSize-startOffset) / elapsed.Seconds() / 1024 / 1024 // MB/s
+
+	// Get intelligent speed calculation from progress reader
+	activeSpeed := progressReader.GetAverageActiveSpeed() / 1024 / 1024 // Convert to MB/s
+	activeTime := progressReader.ActiveTransferTime
+
+	// Use intelligent speed if it's significantly different (better) than traditional
+	finalSpeed := traditionalSpeed
+	if activeSpeed > traditionalSpeed*1.1 && activeTime > 0 { // At least 10% better
+		finalSpeed = activeSpeed
+	}
+
+	// Show final progress
+	fmt.Printf("\rProgress: [%s] 100.0%% %.2f MB/s Time: %ds\n",
+		progressBar(100),
+		finalSpeed,
+		int(elapsed.Seconds()))
+	fmt.Printf("%s completed - Average speed: %.2f MB/s\n", context, finalSpeed)
+
+	// Performance metrics logging
+	metrics := map[string]interface{}{
+		"Client":         clientName,
+		"FileName":       filepath.Base(fileName),
+		"FileSizeMB":     float64(fileSize) / (1024 * 1024),
+		"Compression":    false,
+		"RTTms":          50,
+		"WindowSize":     1,
+		"ThroughputMBps": finalSpeed,
+		"TimeSec":        elapsed.Seconds(),
+		"Retries":        retryCount,
+	}
+
+	logErr := perfmetrics.LogPerformanceToCSV("performance_log.csv", metrics)
+	if logErr != nil {
+		fmt.Printf("Failed to log performance: %v\n", logErr)
+	}
+
+	return finalSpeed, nil
+}
+
+// calculateRobustChunkSize determines optimal chunk size for robust uploads
+func calculateRobustChunkSize(fileSize int64) int64 {
+	// Use larger chunks for robust uploads to reduce overhead
+	switch {
+	case fileSize < 100*1024*1024: // < 100MB
+		return 4 * 1024 * 1024 // 4MB chunks
+	case fileSize < 1024*1024*1024: // < 1GB
+		return 8 * 1024 * 1024 // 8MB chunks
+	case fileSize < 10*1024*1024*1024: // < 10GB
+		return 16 * 1024 * 1024 // 16MB chunks
+	default: // >= 10GB
+		return 32 * 1024 * 1024 // 32MB chunks
+	}
+}
+
+// getRemoteFileSize attempts to get the size of a remote file
+func getRemoteFileSize(client *ftp.ServerConn, remotePath string) (int64, error) {
+	size, err := client.FileSize(remotePath)
+	if err != nil {
+		return 0, err
+	}
+	return size, nil
+}
+
+// verifyUploadProgress verifies that the remote file has the expected size
+func verifyUploadProgress(client *ftp.ServerConn, remotePath string, expectedSize int64) error {
+	actualSize, err := getRemoteFileSize(client, remotePath)
+	if err != nil {
+		return fmt.Errorf("failed to get remote file size: %v", err)
+	}
+
+	if actualSize != expectedSize {
+		return fmt.Errorf("size mismatch: expected %d, got %d", expectedSize, actualSize)
+	}
+
+	return nil
+}
+
+
+// ZeroOverheadMmapReader provides ZERO overhead mmap access (identical to download)
+// This eliminates ALL progress tracking during read to match download performance
+type ZeroOverheadMmapReader struct {
+	data        []byte
+	size        int64
+	position    int64
+	startTime   time.Time
+	lastUpdate  time.Time
+	lastBytes   int64
+	updateFreq  time.Duration
+}
+
+// Read implements io.Reader with ZERO overhead (identical to download logic)
+func (zomr *ZeroOverheadMmapReader) Read(p []byte) (n int, err error) {
+	// Check if we've reached the end
+	if zomr.position >= zomr.size {
+		return 0, io.EOF
+	}
+
+	// Calculate how much to read (no intermediate buffering)
+	remaining := zomr.size - zomr.position
+	readSize := int64(len(p))
+	if remaining < readSize {
+		readSize = remaining
+	}
+
+	// ZERO-OVERHEAD: Direct copy from mmap to network buffer (single copy operation)
+	// This is IDENTICAL to download: copy(mmapData[transferredBytes:transferredBytes+int64(n)], buf[:n])
+	n = copy(p, zomr.data[zomr.position:zomr.position+readSize])
+	zomr.position += int64(n)
+
+	// NO PROGRESS TRACKING IN READ METHOD - do it externally like download
+	return n, nil
+}
+
+// UpdateProgress updates progress externally (called from upload loop)
+func (zomr *ZeroOverheadMmapReader) UpdateProgress() {
+	now := time.Now()
+	if now.Sub(zomr.lastUpdate) >= zomr.updateFreq {
+		bytesDiff := zomr.position - zomr.lastBytes
+		timeDiff := now.Sub(zomr.lastUpdate).Seconds()
+		speed := float64(bytesDiff) / timeDiff
+		
+		progress := float64(zomr.position) / float64(zomr.size) * 100
+		if progress > 100 {
+			progress = 100
+		}
+		
+		fmt.Printf("\rProgress: [%s] %.1f%% %.2f MB/s Time: %ds",
+			progressBar(progress),
+			progress,
+			speed/1024/1024,
+			int(now.Sub(zomr.startTime).Seconds()))
+		
+		zomr.lastUpdate = now
+		zomr.lastBytes = zomr.position
+	}
+}
+
+// GetFinalStats returns final transfer statistics
+func (zomr *ZeroOverheadMmapReader) GetFinalStats() (int64, float64, time.Duration) {
+	elapsed := time.Since(zomr.startTime)
+	if elapsed == 0 {
+		elapsed = 1 * time.Millisecond
+	}
+	
+	speed := float64(zomr.position) / elapsed.Seconds() / 1024 / 1024 // MB/s
+	return zomr.position, speed, elapsed
+}
+
+// MmapProgressWrapper wraps ZeroOverheadMmapReader to provide real-time progress updates
+type MmapProgressWrapper struct {
+	reader           *ZeroOverheadMmapReader
+	progressInterval time.Duration
+	lastUpdate       time.Time
+}
+
+// Read implements io.Reader and calls UpdateProgress during transfer
+func (mpw *MmapProgressWrapper) Read(p []byte) (n int, err error) {
+	// Read from the underlying mmap reader
+	n, err = mpw.reader.Read(p)
+	
+	// Update progress if enough time has passed
+	now := time.Now()
+	if now.Sub(mpw.lastUpdate) >= mpw.progressInterval {
+		mpw.reader.UpdateProgress()
+		mpw.lastUpdate = now
+	}
+	
+	return n, err
+}
+

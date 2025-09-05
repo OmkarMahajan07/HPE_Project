@@ -1,0 +1,110 @@
+{
+  "admin": {
+    "username": "admin",
+    "password": "$2a$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi",
+    "homeDir": "admin",
+    "permissions": {
+      "Read": true,
+      "Write": true,
+      "Delete": true,
+      "Create": true,
+      "List": true,
+      "Rename": true,
+      "Resume": true,
+      "Compress": false,
+      "Parallel": true
+    },
+    "maxConnections": 50,
+    "bandwidthLimit": 0
+  },
+  "anonymous": {
+    "username": "anonymous",
+    "password": "",
+    "homeDir": "anonymous",
+    "permissions": {
+      "Read": true,
+      "Write": false,
+      "Delete": false,
+      "Create": false,
+      "List": true,
+      "Rename": false,
+      "Resume": true,
+      "Compress": false,
+      "Parallel": false
+    },
+    "maxConnections": 5,
+    "bandwidthLimit": 0
+  },
+  "omkar": {
+    "username": "omkar",
+    "password": "$2a$10$VNcrCohaMEZNqw..fvxIAOnD98UWjryvalApujgnfZ7Uj0j0P3jBy",
+    "homeDir": ".",
+    "permissions": {
+      "Read": true,
+      "Write": true,
+      "Delete": false,
+      "Create": true,
+      "List": true,
+      "Rename": false,
+      "Resume": true,
+      "Compress": true,
+      "Parallel": true
+    },
+    "maxConnections": 10,
+    "bandwidthLimit": 0
+  },
+  "omkar2": {
+    "username": "omkar2",
+    "password": "$2a$10$PCbPfX3K3J/DgqmqZOx70e0nF5QfsEM.SNACTujAfqJszdpDG0wby",
+    "homeDir": ".",
+    "permissions": {
+      "Read": true,
+      "Write": true,
+      "Delete": false,
+      "Create": true,
+      "List": true,
+      "Rename": false,
+      "Resume": true,
+      "Compress": true,
+      "Parallel": true
+    },
+    "maxConnections": 10,
+    "bandwidthLimit": 0
+  },
+  "osm": {
+    "username": "osm",
+    "password": "$2a$10$/E4Qhkh03/2Z9MbkdqB.0uerGkpT9jUQoV2K3Pukz04ayBZ..WGcG",
+    "homeDir": ".",
+    "permissions": {
+      "Read": true,
+      "Write": true,
+      "Delete": false,
+      "Create": true,
+      "List": true,
+      "Rename": false,
+      "Resume": true,
+      "Compress": true,
+      "Parallel": true
+    },
+    "maxConnections": 10,
+    "bandwidthLimit": 0
+  },
+  "user": {
+    "username": "user",
+    "password": "$2a$10$5m5X/8lLWi5hyXSDFyxMZOMOzPJ86kYoBEQ7BvungVkEZii3hV/7.",
+    "homeDir": "test",
+    "permissions": {
+      "Read": true,
+      "Write": true,
+      "Delete": false,
+      "Create": true,
+      "List": true,
+      "Rename": false,
+      "Resume": true,
+      "Compress": false,
+      "Parallel": false
+    },
+    "maxConnections": 10,
+    "bandwidthLimit": 0
+  }
+}
